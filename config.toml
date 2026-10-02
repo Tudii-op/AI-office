@@ -7,7 +7,8 @@ builder = "claude"     # who edits files
 reviewer = "gpt"       # who reviews (read-only)
 
 [claude]
-model = ""             # empty = Claude Code default
+model = ""             # empty = Claude Code default (DeepSeek/you can change it live)
+models = ["fable", "opus", "sonnet", "haiku"]  # what DeepSeek may pick from
 timeout = 1200         # seconds per turn
 
 [gpt]

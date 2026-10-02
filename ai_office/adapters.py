@@ -36,9 +36,11 @@ class ClaudeAgent:
     def __init__(self, model="", timeout=1200):
         self.model = model
         self.timeout = timeout
+        self.last_rate_limit = None  # rate_limit_info from the last run
 
     def run(self, prompt, system, workspace, can_edit):
-        cmd = ["claude", "-p", "--output-format", "json", "--append-system-prompt", system]
+        cmd = ["claude", "-p", "--output-format", "stream-json", "--verbose",
+               "--append-system-prompt", system]
         if self.model:
             cmd += ["--model", self.model]
         if can_edit:
@@ -46,13 +48,21 @@ class ClaudeAgent:
         else:
             cmd += ["--permission-mode", "dontAsk", "--allowedTools", "Read,Grep,Glob"]
         p = _run(cmd, prompt, workspace, self.timeout, self.label)
-        try:
-            data = json.loads(p.stdout)
-        except json.JSONDecodeError:
-            raise AgentError(f"Claude returned non-JSON output:\n{p.stdout[-3000:]}\n{p.stderr}")
-        if data.get("is_error"):
-            raise AgentError(f"Claude reported an error:\n{json.dumps(data, indent=2)[:4000]}")
-        return data.get("result", "")
+        result = None
+        for line in p.stdout.splitlines():
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("type") == "rate_limit_event":
+                self.last_rate_limit = ev.get("rate_limit_info") or self.last_rate_limit
+            elif ev.get("type") == "result":
+                result = ev
+        if result is None:
+            raise AgentError(f"Claude returned no result event:\n{p.stdout[-3000:]}\n{p.stderr}")
+        if result.get("is_error"):
+            raise AgentError(f"Claude reported an error:\n{json.dumps(result, indent=2)[:4000]}")
+        return result.get("result", "")
 
 
 class GptAgent:
@@ -90,10 +100,16 @@ class FakeAgent:
     def __init__(self, key, label):
         self.key = key
         self.label = label
+        self.model = ""
         self.calls = 0
+        self.last_rate_limit = None
 
     def run(self, prompt, system, workspace, can_edit):
         self.calls += 1
+        if self.key == "claude":
+            self.last_rate_limit = {"status": "allowed", "unifiedWindows": {
+                "five_hour": {"utilization": 0.1 * self.calls, "resetsAt": None},
+                "seven_day": {"utilization": 0.02 * self.calls, "resetsAt": None}}}
         if can_edit:
             f = Path(workspace) / "fake_output.txt"
             with f.open("a") as fh:

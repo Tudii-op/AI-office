@@ -12,8 +12,18 @@ class DeepSeekError(RuntimeError):
 MANAGER_SYSTEM = """You are DeepSeek, the manager in "AI Office". The human talks ONLY to you.
 You lead a team of two AIs, Claude and GPT, who share a project folder: one is the builder (edits files), the other the reviewer (read-only). They talk to each other directly; you brief them, answer their questions, and report back to the human. You cannot edit files yourself.
 
+You also run the office itself. Each turn you get "# Office state": mode, roles, current models and the models available, turn limit, workspace, past sessions, and subscription usage (5-hour and weekly limits, which refresh after each agent's turn).
+
 Every reply must be JSON only:
-{"to": "human" | "team", "message": "<text>", "new_task": true | false}
+{"to": "human" | "team", "message": "<text>", "new_task": true | false, "actions": [ ... ]}
+
+"actions" is optional; they run BEFORE your message is delivered. Available actions:
+- {"do": "set_model", "agent": "claude" | "gpt", "model": "<name from the available list, or \"\" for default>"}
+- {"do": "swap_roles"}                        (builder <-> reviewer)
+- {"do": "set_turns", "n": <int 1-50>}        (max team turns per round)
+- {"do": "new_session"}                       (clear the team chat and task; starts a new log)
+- {"do": "set_workspace", "path": "<folder>"} (a plain name = AI-office/workspaces/<name>; or an existing absolute/~ path)
+Results of actions show up in the next "What just happened". Only use actions when the human asks or when clearly sensible; tell the human what you changed.
 
 - to "human": chat, ask a clarifying question, or report results. When the team finished, summarize what was built, which files changed, open issues and any disagreements.
 - to "team": a clear, self-contained brief (goal, constraints, what "done" looks like), or an answer to a question they asked you.
@@ -21,6 +31,7 @@ Every reply must be JSON only:
 - Only delegate when there is real work to do. Small talk and questions you can answer yourself go to the human.
 - Ask the human before delegating only when the request is genuinely ambiguous.
 - Don't answer team questions that are really the human's call (taste, money, scope); ask the human instead.
+- Usage: answer usage questions from the Office state. If an agent is above ~80% of a window, warn the human before delegating big work and suggest options (cheaper model, swap roles, wait for the reset).
 Be concise and friendly."""
 
 ROUTER_SYSTEM = """You are the manager of a chat where two AIs (a builder and a reviewer) work on a goal.
@@ -109,11 +120,21 @@ class FakeDeepSeek:
 
     def manage(self, messages):
         event = messages[-1]["content"].split("# What just happened\n", 1)[-1]
+        reply = lambda to, msg, new=False, actions=(): {"to": to, "message": msg, "new_task": new, "actions": list(actions)}
         if event.startswith("The human says:"):
-            said = event.split(":", 1)[1].strip()
-            if said.lower().startswith(("hi", "hello", "are you")):
-                return {"to": "human", "message": "[fake] Hi! I'm DeepSeek. Tell me what to build.", "new_task": False}
-            return {"to": "team", "message": f"[fake brief] Build this: {said}", "new_task": True}
+            said = event.split(":", 1)[1].strip().lower()
+            if said.startswith(("hi", "hello", "are you")):
+                return reply("human", "[fake] Hi! I'm DeepSeek. Tell me what to build.")
+            if "usage" in said:
+                state = messages[-1]["content"]
+                line = next((l for l in state.splitlines() if l.startswith("usage:")), "usage: ?")
+                return reply("human", f"[fake] {line}")
+            if said.startswith("use "):
+                agent, model = said.split()[1:3]
+                return reply("human", f"[fake] switching {agent} to {model}", actions=[{"do": "set_model", "agent": agent, "model": model}])
+            if "new session" in said:
+                return reply("human", "[fake] fresh session started", actions=[{"do": "new_session"}])
+            return reply("team", f"[fake brief] Build this: {said}", new=True)
         if "finished" in event:
-            return {"to": "human", "message": "[fake report] The team finished. Files: fake_output.txt.", "new_task": False}
-        return {"to": "human", "message": f"[fake] Team needs you: {event[:200]}", "new_task": False}
+            return reply("human", "[fake report] The team finished. Files: fake_output.txt.")
+        return reply("human", f"[fake] {event[:300]}")

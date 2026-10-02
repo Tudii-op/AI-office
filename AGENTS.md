@@ -14,4 +14,7 @@ Terminal app: Claude (via `claude -p`) and GPT (via `codex exec`) work as builde
 - `ai_office/office.py`: chat history, turn loop, role prompts, commands
 - `ai_office/gitops.py`: auto-commit per turn in the workspace
 - `ai_office/ui.py`: terminal rendering/input
+- `ai_office/usage.py`: 5h/weekly usage from Claude stream-json + Codex session logs
+- DeepSeek manager can run actions (set_model, swap_roles, set_turns, new_session, set_workspace): `Office.apply_actions`
+- `--fake` writes only to `logs/fake/` and `state/fake/`
 - Standard library only. Python 3.11+.

@@ -29,7 +29,11 @@ uv run ai-office --fake                  # free dry run, no AI calls
 - each team AI ends with `STATUS: CONTINUE | DONE | ASK_MANAGER`
 - a round ends when the reviewer says DONE, DeepSeek says done/stuck, someone asks a question, or the turn limit is hit. Then DeepSeek answers the team or reports to you
 - type a line + Enter while they work to interject; **Ctrl+C** to pause
-- `/swap` `/turns N` `/deepseek on|off` `/status` `/quit`
+- just ask DeepSeek in plain words: "how's our usage?", "switch GPT to gpt-6-luna", "make Claude the reviewer", "start a new session", "work in ~/Workplace/foo"
+- or use commands: `/usage` `/model claude|gpt [name]` `/swap` `/turns N` `/new` `/deepseek on|off` `/status` `/quit`
+
+## Usage tracking
+Claude's and GPT's 5-hour and weekly subscription limits are recorded after every turn (from Claude's `rate_limit_event` and Codex's local session logs), so there are no extra calls. DeepSeek sees them and warns you above ~80%. Model/role/turn changes are remembered in `state/`.
 
 Every turn that changes files is auto-committed in the workspace (`[Claude] ...`), so `git revert` undoes a bad round. Chat logs go to `logs/`.
 

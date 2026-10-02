@@ -8,6 +8,7 @@ from pathlib import Path
 from . import gitops, ui
 from .adapters import AgentError
 from .deepseek import DeepSeekError
+from .usage import Usage
 
 STATUS_RE = re.compile(r"STATUS:\s*(CONTINUE|DONE|ASK_MANAGER|NEED_HUMAN)", re.I)
 
@@ -40,15 +41,36 @@ HELP = """commands:
   /turns N         max team turns per round (now {turns})
   /deepseek on|off on: you talk to DeepSeek, it runs the team (now {ds})
                    off: you talk to the team directly
-  /status          show roles and settings
+  /usage           Claude + GPT 5-hour / weekly usage
+  /model claude|gpt [name]  change a model (no name = default)
+  /new             new session (clear the team chat)
+  /status          show roles, models and settings
   /quit            leave
-While the team works: type a line + Enter to interject; Ctrl+C to pause."""
+While the team works: type a line + Enter to interject; Ctrl+C to pause.
+With DeepSeek on, you can also just ask it for any of this in plain words."""
+
+
+CLAUDE_MODELS = ["fable", "opus", "sonnet", "haiku"]
+CODEX_MODELS_CACHE = Path.home() / ".codex" / "models_cache.json"
+
+
+def gpt_models():
+    try:
+        data = json.loads(CODEX_MODELS_CACHE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    return [m["slug"] for m in data.get("models", []) if m.get("visibility") == "list" and m.get("slug")]
 
 
 class Office:
-    def __init__(self, agents, workspace, cfg, deepseek=None, log_dir=None):
+    def __init__(self, agents, workspace, cfg, deepseek=None, log_dir=None, state_dir=None, workspaces_dir=None):
         self.agents = agents  # {"claude": agent, "gpt": agent}
         self.workspace = Path(workspace)
+        self.workspaces_dir = Path(workspaces_dir or self.workspace.parent)
+        self.state_dir = Path(state_dir or "state")
+        self.usage = Usage(self.state_dir / "usage.json")
+        self.models = {"claude": cfg.get("claude", {}).get("models", CLAUDE_MODELS), "gpt": gpt_models()}
+        self.notes = []  # action results / warnings for DeepSeek's next call
         loop = cfg.get("loop", {})
         self.max_turns = loop.get("max_turns", 8)
         self.recap_every = loop.get("recap_every", 4)
@@ -65,10 +87,115 @@ class Office:
         self.recap_upto = 0
         self.goal = ""
         self.resume_role = "builder"
-        log_dir = Path(log_dir or "logs")
-        log_dir.mkdir(parents=True, exist_ok=True)
-        self.log_path = log_dir / f"{datetime.now():%Y-%m-%d_%H-%M-%S}.md"
+        self.log_dir = Path(log_dir or "logs")
+        self.load_settings()
+        self.usage.update_gpt()  # free: read Codex's last known limits
+        self.start_log()
+
+    # ---------- settings & sessions ----------
+
+    def load_settings(self):
+        try:
+            s = json.loads((self.state_dir / "settings.json").read_text())
+        except (OSError, json.JSONDecodeError):
+            return
+        for k, m in s.get("models", {}).items():
+            if k in self.agents:
+                self.agents[k].model = m
+        if sorted(s.get("roles", {}).values()) == ["claude", "gpt"]:
+            self.roles = s["roles"]
+        self.max_turns = s.get("max_turns", self.max_turns)
+
+    def save_settings(self):
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        (self.state_dir / "settings.json").write_text(json.dumps({
+            "models": {k: a.model for k, a in self.agents.items()},
+            "roles": self.roles,
+            "max_turns": self.max_turns,
+        }, indent=2))
+
+    def start_log(self):
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        stamp, n = f"{datetime.now():%Y-%m-%d_%H-%M-%S}", 1
+        self.log_path = self.log_dir / f"{stamp}.md"
+        while self.log_path.exists():
+            n += 1
+            self.log_path = self.log_dir / f"{stamp}_{n}.md"
         self.log_path.write_text(f"# AI Office session\n\nworkspace: `{self.workspace}`\n")
+
+    def new_session(self):
+        self.history, self.recap, self.recap_upto = [], "", 0
+        self.goal, self.resume_role = "", "builder"
+        self.start_log()
+        return f"new session; log: {self.log_path.name}"
+
+    def set_workspace(self, path):
+        raw = str(path).strip()
+        if not raw:
+            raise ValueError("empty path")
+        if "/" in raw or raw.startswith("~"):
+            p = Path(raw).expanduser().resolve()
+            if not p.is_dir():
+                raise ValueError(f"{p} doesn't exist (only workspaces/<name> folders get created automatically)")
+        else:
+            p = (self.workspaces_dir / raw).resolve()
+            p.mkdir(parents=True, exist_ok=True)
+        self.workspace = p
+        gitops.ensure_repo(p)
+        return f"workspace is now {p}"
+
+    def model_name(self, key):
+        return self.agents[key].model or "default"
+
+    def office_state(self):
+        labels = {k: self.label(k) for k in self.agents}
+        sessions = sorted(self.log_dir.glob("*.md"))[-5:]
+        return "\n".join([
+            f"mode: {'human ⇄ DeepSeek ⇄ team' if self.ds_on else 'human ⇄ team'}",
+            f"roles: builder={self.label(self.roles['builder'])}, reviewer={self.label(self.roles['reviewer'])}",
+            f"models: Claude={self.model_name('claude')}, GPT={self.model_name('gpt')}",
+            f"available models: claude: {', '.join(self.models['claude']) or '?'} (or a full claude-* id); "
+            f"gpt: {', '.join(self.models['gpt']) or '?'}",
+            f"max turns per round: {self.max_turns}",
+            f"workspace: {self.workspace}",
+            f"current session log: {self.log_path.name}; recent sessions: {', '.join(p.name for p in sessions)}",
+            f"usage: {self.usage.summary(labels)}",
+        ])
+
+    def apply_actions(self, actions, by="DeepSeek"):
+        for a in actions or []:
+            do = a.get("do") if isinstance(a, dict) else None
+            try:
+                if do == "set_model":
+                    key, model = a.get("agent"), str(a.get("model", "")).strip()
+                    if key not in self.agents:
+                        raise ValueError(f"unknown agent {key!r}")
+                    ok = self.models[key] or [model]
+                    if model and model not in ok and not (key == "claude" and model.startswith("claude-")):
+                        raise ValueError(f"{model!r} isn't an available {key} model")
+                    self.agents[key].model = model
+                    result = f"{self.label(key)} model → {model or 'default'}"
+                elif do == "swap_roles":
+                    self.roles = {"builder": self.roles["reviewer"], "reviewer": self.roles["builder"]}
+                    result = f"builder: {self.label(self.roles['builder'])}, reviewer: {self.label(self.roles['reviewer'])}"
+                elif do == "set_turns":
+                    n = int(a.get("n"))
+                    if not 1 <= n <= 50:
+                        raise ValueError("turns must be 1-50")
+                    self.max_turns = n
+                    result = f"max turns → {n}"
+                elif do == "new_session":
+                    result = self.new_session()
+                elif do == "set_workspace":
+                    result = self.set_workspace(a.get("path", ""))
+                else:
+                    raise ValueError(f"unknown action {a!r}")
+                self.save_settings()
+                self.system(f"{by}: {result}")
+                self.notes.append(f"action ok: {result}")
+            except (ValueError, TypeError) as e:
+                self.system(f"{by}: action failed: {e}")
+                self.notes.append(f"action FAILED ({do}): {e}")
 
     # ---------- chat ----------
 
@@ -133,7 +260,10 @@ class Office:
 
     def ask_manager(self, event):
         team = self.context() if self.goal else "(no task yet; the team is idle)"
-        msg = f"# Team status\n{team}\n\n# What just happened\n{event}"
+        msg = f"# Office state\n{self.office_state()}\n\n# Team status\n{team}\n\n# What just happened\n{event}"
+        if self.notes:
+            msg += "\n\n# Results of your last actions\n" + "\n".join(self.notes)
+            self.notes = []
         messages = self.mgr_history[-self.manager_window:] + [{"role": "user", "content": msg}]
         ui.note("DeepSeek is thinking")
         try:
@@ -151,6 +281,7 @@ class Office:
             d = self.ask_manager(event)
             if d is None:
                 return
+            self.apply_actions(d.get("actions"))
             if d["to"] == "human":
                 self.add("deepseek", d["message"], tag="→ you", private=True)
                 return
@@ -174,8 +305,19 @@ class Office:
             ask="ASK_MANAGER" if self.ds_on else "NEED_HUMAN ",
         )
         prompt = f"{self.context()}\n\n# Your turn\nYou are {self.label(key)} ({role}). Respond now."
-        ui.note(f"{self.label(key)} is working as {role}")
-        text = self.agents[key].run(prompt, system, self.workspace, can_edit=(role == "builder"))
+        five_h = self.usage.pct(key)
+        if five_h is not None and five_h >= 90:
+            ui.say("error", f"{self.label(key)} is at {five_h}% of its 5-hour limit")
+        ui.note(f"{self.label(key)} ({self.model_name(key)}) is working as {role}")
+        started = datetime.now().timestamp()
+        agent = self.agents[key]
+        try:
+            text = agent.run(prompt, system, self.workspace, can_edit=(role == "builder"))
+        finally:
+            if key == "claude":
+                self.usage.update_claude(agent.last_rate_limit)
+            else:
+                self.usage.update_gpt(since=started)
         m = STATUS_RE.findall(text)
         status = m[-1].upper() if m else "CONTINUE"
         self.add(key, text.strip(), tag=role)
@@ -274,10 +416,19 @@ class Office:
         parts = cmd.split()
         if parts[0] == "/swap":
             self.roles = {"builder": self.roles["reviewer"], "reviewer": self.roles["builder"]}
+            self.save_settings()
             self.system(f"builder: {self.label(self.roles['builder'])}, reviewer: {self.label(self.roles['reviewer'])}")
         elif parts[0] == "/turns" and len(parts) == 2 and parts[1].isdigit():
             self.max_turns = int(parts[1])
+            self.save_settings()
             self.system(f"max turns: {self.max_turns}")
+        elif parts[0] == "/usage":
+            self.usage.update_gpt()
+            self.system(self.usage.render({k: self.label(k) for k in self.agents}))
+        elif parts[0] == "/model" and len(parts) in (2, 3) and parts[1] in self.agents:
+            self.apply_actions([{"do": "set_model", "agent": parts[1], "model": parts[2] if len(parts) == 3 else ""}], by="you")
+        elif parts[0] == "/new":
+            self.system(self.new_session())
         elif parts[0] == "/deepseek" and len(parts) == 2:
             if self.deepseek is None:
                 self.system("DeepSeek isn't configured: put DEEPSEEK_API_KEY in .env (or enable it in config.toml)")
@@ -288,7 +439,8 @@ class Office:
             mode = "you ⇄ DeepSeek ⇄ team" if self.ds_on else "you ⇄ team (DeepSeek off)"
             self.system(
                 f"{mode}\nbuilder: {self.label(self.roles['builder'])} · reviewer: {self.label(self.roles['reviewer'])} · "
-                f"turns: {self.max_turns}\nworkspace: {self.workspace}\nlog: {self.log_path}"
+                f"turns: {self.max_turns}\nmodels: Claude={self.model_name('claude')} · GPT={self.model_name('gpt')}\n"
+                f"workspace: {self.workspace}\nlog: {self.log_path}"
             )
         else:
             print(HELP.format(turns=self.max_turns, ds="on" if self.ds_on else "off"))

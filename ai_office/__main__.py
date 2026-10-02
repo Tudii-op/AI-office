@@ -48,7 +48,9 @@ def main():
             deepseek = DeepSeek(ds.get("base_url", "https://api.deepseek.com"),
                                 ds.get("model", "deepseek-chat"), key, ds.get("timeout", 120))
 
-    Office(agents, workspace, cfg, deepseek=deepseek, log_dir=ROOT / "logs").loop()
+    sub = "fake" if args.fake else ""  # fake runs never touch real logs/state
+    Office(agents, workspace, cfg, deepseek=deepseek, log_dir=ROOT / "logs" / sub,
+           state_dir=ROOT / "state" / sub, workspaces_dir=ROOT / "workspaces").loop()
 
 
 if __name__ == "__main__":
