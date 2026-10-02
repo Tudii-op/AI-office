@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .adapters import make_agent
 from .deepseek import DeepSeek, FakeDeepSeek
+from . import ui
 from .office import Office
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -24,8 +25,8 @@ def load_env(path):
 
 def main():
     ap = argparse.ArgumentParser(prog="ai-office", description="Claude + GPT as coworkers, DeepSeek as manager.")
-    ap.add_argument("-w", "--workspace", default=str(ROOT / "workspaces" / "default"),
-                    help="folder the AIs work in (default: workspaces/default)")
+    ap.add_argument("-w", "--workspace", default=os.getcwd(),
+                    help="folder the AIs work in (default: where you run ai-office; can be ~)")
     ap.add_argument("-c", "--config", default=str(ROOT / "config.toml"))
     ap.add_argument("--fake", action="store_true", help="fake Claude/GPT/DeepSeek: test the flow for free")
     args = ap.parse_args()
@@ -49,8 +50,9 @@ def main():
                                 ds.get("model", "deepseek-chat"), key, ds.get("timeout", 120))
 
     sub = "fake" if args.fake else ""  # fake runs never touch real logs/state
-    Office(agents, workspace, cfg, deepseek=deepseek, log_dir=ROOT / "logs" / sub,
-           state_dir=ROOT / "state" / sub, workspaces_dir=ROOT / "workspaces").loop()
+    office = Office(agents, workspace, cfg, deepseek=deepseek, log_dir=ROOT / "logs" / sub,
+                    state_dir=ROOT / "state" / sub, workspaces_dir=ROOT / "workspaces")
+    ui.run(office, history_path=ROOT / "state" / sub / "input_history")
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ max_turns = 8          # AI turns per goal before it stops and asks you
 recap_every = 4        # DeepSeek recaps after this many new messages
 keep_recent = 2        # messages kept word-for-word after a recap
 no_recap_window = 10   # messages sent as context when DeepSeek is off
+auto_commit = "sandbox"  # commit each turn: "sandbox" (only AI-office/workspaces/*), "always" (any repo root except ~), "never"
 builder = "claude"     # who edits files
 reviewer = "gpt"       # who reviews (read-only)
 
@@ -21,3 +22,18 @@ base_url = "https://api.deepseek.com"
 model = "deepseek-chat"          # set to the latest model name you want
 api_key_env = "DEEPSEEK_API_KEY" # read from env or .env
 timeout = 120
+
+[permissions]
+# full: Claude/GPT run anything (git, files, builds, installs inside the project, internet).
+#       Only risky/system stuff is asked (sudo, system packages, outside-project writes, secrets,
+#       git push/reset --hard, …: see ai_office/safety.py) → DeepSeek → you.
+# ask:  every command not pre-allowed is approved by DeepSeek or you.
+# auto: Claude Code's own auto mode decides; nothing is asked.
+# Switch live with /permissions or by telling DeepSeek.
+mode = "full"
+approver = "deepseek"        # who answers risky requests first: "deepseek" (asks you when unsure) or "human"
+reviewer_can_run = true      # reviewer / consult may run commands, never edit files
+claude_allow = ["Bash(ls:*)", "Bash(cat:*)", "Bash(pwd)", "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)"]
+gpt_network = false          # GPT internet in "ask"/"auto" modes (always on in "full")
+gpt_unsandboxed = false      # "full" + true = GPT runs with no sandbox at all (Codex can't ask first!)
+gpt_auto_review = false      # GPT: Codex's --approve-for-me automatic review

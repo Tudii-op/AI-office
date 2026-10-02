@@ -18,24 +18,72 @@ codex login             # make sure you're logged in
 
 ## Run
 ```bash
-uv run ai-office                         # works in workspaces/default
-uv run ai-office -w ~/Workplace/foo      # work on a real project folder
-uv run ai-office --fake                  # free dry run, no AI calls
+ai-office                         # the AIs work where you run it (like claude / codex); ~ works too
+ai-office -w ~/Workplace/foo      # or pick a folder
+ai-office --fake                  # free dry run, no AI calls
 ```
-(or `python -m ai_office ...`)
+(installed globally with `uv tool install -e .`; or `python -m ai_office ...`)
+
+**Workspace = the AIs' `./`.** Running from `~` makes your whole home folder their playground. Even then, Claude must ask before touching your config/dotfiles (`~/.config`, `~/.zshrc`, `~/.mydotfiles`…), secrets, or deleting/moving whole top-level folders (`~/Documents`, `~/Workplace/<project>`). GPT's sandbox covers the whole workspace and can't ask first.
 
 ## In the chat
 - talk to DeepSeek; when there's work it sends a brief to the team
-- each team AI ends with `STATUS: CONTINUE | DONE | ASK_MANAGER`
+- each team AI ends with a one-line `REPORT:` (what changed, tests, blockers) and `STATUS: CONTINUE | DONE | ASK_MANAGER`; DeepSeek reads the reports instead of full messages to save tokens
 - a round ends when the reviewer says DONE, DeepSeek says done/stuck, someone asks a question, or the turn limit is hit. Then DeepSeek answers the team or reports to you
-- type a line + Enter while they work to interject; **Ctrl+C** to pause
+- the input box is always live: messages typed while the team works are queued for the next turn; **Esc** or **Ctrl+C** stops them instantly
+- ask one AI something without starting work: "ask GPT if Postgres or SQLite fits here". DeepSeek consults it (read-only) and relays the answer
+- DeepSeek can check the team's work itself (list files, read a file, git log)
 - just ask DeepSeek in plain words: "how's our usage?", "switch GPT to gpt-6-luna", "make Claude the reviewer", "start a new session", "work in ~/Workplace/foo"
-- or use commands: `/usage` `/model claude|gpt [name]` `/swap` `/turns N` `/new` `/deepseek on|off` `/status` `/quit`
+- or use commands: `/usage` `/model claude|gpt [name]` `/swap` `/turns N` `/new` `/forget` `/permissions` `/approvals` `/deepseek on|off` `/status` `/quit`
+
+## Permissions
+Three modes. Switch live with `/permissions full|ask|auto` or tell DeepSeek. Default: **full**.
+
+| mode | Claude | GPT |
+|---|---|---|
+| `full` | runs anything (git, files, builds, installs in the project, web). Only **risky/system** stuff is asked | sandbox confined to the project, internet on |
+| `ask` | every command not pre-allowed goes to DeepSeek → you | sandbox, no internet |
+| `auto` | Claude Code's own auto mode decides | sandbox |
+
+**Risky** (full mode, see `ai_office/safety.py`; tune freely): sudo/su, system packages (pacman, yay…), systemctl, reboot, disk tools, kill/pkill, hyprctl, global npm/pip installs, writes/deletes outside the project (also after `cd`), your config/dotfiles, deleting/moving whole top-level folders, secrets (`~/.ssh`, `~/.aws`, `.env`, credentials), `curl … | sh`, git push / reset --hard / clean -f / global config.
+
+Risky requests go: your saved "always" rules → DeepSeek (`prompts/approver.md`) → you:
+```
+🔐 Claude (builder) wants to run: sudo pacman -S htop
+   ⚠ flagged: `sudo` runs as root
+   [y] allow  [a] always (Bash(sudo pacman:*))  [n] deny  · or type a reason to deny
+```
+- "always" rules: `state/approvals.json` (`/approvals`, `/approvals clear`). Chained/redirected commands never match a rule.
+- Reviewer/consult may run commands but never edit files.
+- GPT can't ask first (`codex exec` has no approval hook), so its sandbox blocks system-level stuff instead. `gpt_unsandboxed = true` removes even that (no checks at all).
+
+## Customize
+- `prompts/*.md`: every instruction each AI gets (manager, router, recap, builder, reviewer, consult…). Edits apply on the next message. See `prompts/README.md`.
+- `config.toml`: turn limits, recap frequency, models list, DeepSeek model, timeouts.
+- DeepSeek remembers your chat across restarts (`state/manager_history.json`); `/forget` clears it.
+
+## Keys
+| key | does |
+|---|---|
+| Enter | send |
+| Ctrl+J · Alt+Enter · `\` at line end · Shift+Enter* | new line |
+| Esc / Ctrl+C | stop the AIs (working) · clear input (idle) |
+| Ctrl+←/→, Alt+B/F | jump by word |
+| Shift+arrows | select |
+| Ctrl+W / Ctrl+Backspace | delete word |
+| Ctrl+U / Ctrl+K | delete to line start / end |
+| ↑/↓ | move between lines, then history |
+| Ctrl+R | search history |
+| Tab | complete /commands and model names |
+| Ctrl+L | clear screen |
+| Ctrl+D or Ctrl+C twice | quit |
+
+\*Shift+Enter in kitty needs this line in `kitty.conf`: `map shift+enter send_text all \x1b[13;2u`
 
 ## Usage tracking
 Claude's and GPT's 5-hour and weekly subscription limits are recorded after every turn (from Claude's `rate_limit_event` and Codex's local session logs), so there are no extra calls. DeepSeek sees them and warns you above ~80%. Model/role/turn changes are remembered in `state/`.
 
-Every turn that changes files is auto-committed in the workspace (`[Claude] ...`), so `git revert` undoes a bad round. Chat logs go to `logs/`.
+Auto-commit (`[Claude] ...` per turn) happens only in AI Office's own `workspaces/*` folders by default; in your real projects you commit yourself (`auto_commit` in `config.toml`). Chat logs go to `logs/`.
 
 ## Roles
 - builder: can edit files (Claude: `acceptEdits`; Codex: `workspace-write` sandbox)

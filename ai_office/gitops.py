@@ -34,3 +34,13 @@ def commit_turn(workspace, label, message):
         "commit", "-q", "-m", f"[{label}] {first}", "--", ".",
     )
     return _git(workspace, "rev-parse", "--short", "HEAD").stdout.strip()
+
+
+def log(workspace, n=10):
+    r = _git(workspace, "log", f"-{n}", "--stat", "--format=%h %an · %ar%n  %s", check=False)
+    return r.stdout.strip()
+
+
+def is_repo_root(workspace):
+    r = _git(workspace, "rev-parse", "--show-toplevel", check=False)
+    return r.returncode == 0 and r.stdout.strip() == str(workspace.resolve())
