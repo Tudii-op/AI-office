@@ -1,0 +1,22 @@
+[loop]
+max_turns = 8          # AI turns per goal before it stops and asks you
+recap_every = 4        # DeepSeek recaps after this many new messages
+keep_recent = 2        # messages kept word-for-word after a recap
+no_recap_window = 10   # messages sent as context when DeepSeek is off
+builder = "claude"     # who edits files
+reviewer = "gpt"       # who reviews (read-only)
+
+[claude]
+model = ""             # empty = Claude Code default
+timeout = 1200         # seconds per turn
+
+[gpt]
+model = ""             # empty = Codex default
+timeout = 1200
+
+[deepseek]
+enabled = true
+base_url = "https://api.deepseek.com"
+model = "deepseek-chat"          # set to the latest model name you want
+api_key_env = "DEEPSEEK_API_KEY" # read from env or .env
+timeout = 120
