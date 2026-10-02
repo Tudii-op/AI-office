@@ -64,6 +64,101 @@ def _run(cmd, stdin, cwd, timeout, who):
     return subprocess.CompletedProcess(cmd, p.returncode, out, err)
 
 
+def _run_stream(cmd, stdin, cwd, timeout, who, on_line):
+    """Like _run, but hands every stdout line to on_line as it arrives (live progress)."""
+    if cancelled.is_set():
+        raise AgentCancelled(f"{who}: stopped")
+    try:
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             cwd=cwd, text=True, bufsize=1, start_new_session=True)
+    except FileNotFoundError:
+        raise AgentError(f"{who}: command not found: {cmd[0]}")
+    with _lock:
+        _running.add(p)
+    err, timed_out = [], []
+
+    def feed():
+        try:
+            p.stdin.write(stdin)
+            p.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+
+    def kill():
+        timed_out.append(True)
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    threading.Thread(target=feed, daemon=True).start()
+    t_err = threading.Thread(target=lambda: err.append(p.stderr.read()), daemon=True)
+    t_err.start()
+    timer = threading.Timer(timeout, kill)
+    timer.start()
+    out = []
+    try:
+        for line in p.stdout:
+            out.append(line)
+            try:
+                on_line(line)
+            except Exception:
+                pass  # a display problem must never break the agent run
+        p.wait()
+    finally:
+        timer.cancel()
+        t_err.join(2)
+        with _lock:
+            _running.discard(p)
+    stdout, stderr = "".join(out), "".join(err)
+    if timed_out:
+        raise AgentError(f"{who}: timed out after {timeout}s")
+    if cancelled.is_set():
+        raise AgentCancelled(f"{who}: stopped")
+    if p.returncode != 0:
+        raise AgentError(f"{who} exited with code {p.returncode}\n--- stderr ---\n{stderr.strip()}\n"
+                         f"--- stdout (tail) ---\n{stdout.strip()[-3000:]}")
+    return subprocess.CompletedProcess(cmd, p.returncode, stdout, stderr)
+
+
+def _short(text, n=90):
+    text = " ".join(str(text).split())
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+def _rel(path, workspace):
+    try:
+        return str(Path(path).resolve().relative_to(Path(workspace).resolve()))
+    except (ValueError, OSError, TypeError):
+        return str(path)
+
+
+def describe_tool(name, inp, workspace):
+    """(kind, short text) for one Claude tool call."""
+    path = inp.get("file_path") or inp.get("notebook_path") or inp.get("path") or ""
+    if name == "Bash":
+        return "command", f"ran {_short(inp.get('command', ''))}"
+    if name == "Read":
+        return "read", f"read {_rel(path, workspace)}"
+    if name == "Write":
+        return "edit", f"wrote {_rel(path, workspace)}"
+    if name in ("Edit", "MultiEdit", "NotebookEdit"):
+        return "edit", f"edited {_rel(path, workspace)}"
+    if name == "Grep":
+        return "search", f"searched for “{_short(inp.get('pattern', ''), 50)}”"
+    if name == "Glob":
+        return "search", f"looked for {_short(inp.get('pattern', ''), 50)}"
+    if name == "WebFetch":
+        return "web", f"fetched {_short(inp.get('url', ''), 70)}"
+    if name == "WebSearch":
+        return "web", f"searched the web for “{_short(inp.get('query', ''), 50)}”"
+    if name == "TodoWrite":
+        return "plan", "updated its todo list"
+    if name in ("Task", "Agent"):
+        return "other", f"started a sub-agent: {_short(inp.get('description', ''), 50)}"
+    return "other", f"used {name}"
+
+
 class ClaudeAgent:
     key = "claude"
     label = "Claude"
@@ -73,8 +168,9 @@ class ClaudeAgent:
         self.timeout = timeout
         self.last_rate_limit = None  # rate_limit_info from the last run
 
-    def run(self, prompt, system, workspace, can_edit, perms=None):
-        """perms (from the office): mode, allowed, disallowed, mcp_config (permission prompts → AI Office)."""
+    def run(self, prompt, system, workspace, can_edit, perms=None, on_event=None):
+        """perms (from the office): mode, allowed, disallowed, mcp_config (permission prompts → AI Office).
+        on_event(kind, text) is called live for each tool call."""
         perms = perms or {"mode": "acceptEdits" if can_edit else "dontAsk",
                           "allowed": [] if can_edit else ["Read", "Grep", "Glob"]}
         cmd = ["claude", "-p", "--output-format", "stream-json", "--verbose",
@@ -89,17 +185,22 @@ class ClaudeAgent:
             cmd += ["--disallowedTools", *perms["disallowed"]]
         if perms.get("allowed"):
             cmd += ["--allowedTools", *perms["allowed"]]
-        p = _run(cmd, prompt, workspace, self.timeout, self.label)
-        result = None
-        for line in p.stdout.splitlines():
-            try:
-                ev = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if ev.get("type") == "rate_limit_event":
+        state = {"result": None}
+
+        def on_line(line):
+            ev = json.loads(line)
+            kind = ev.get("type")
+            if kind == "rate_limit_event":
                 self.last_rate_limit = ev.get("rate_limit_info") or self.last_rate_limit
-            elif ev.get("type") == "result":
-                result = ev
+            elif kind == "result":
+                state["result"] = ev
+            elif kind == "assistant" and on_event:
+                for c in (ev.get("message") or {}).get("content") or []:
+                    if isinstance(c, dict) and c.get("type") == "tool_use":
+                        on_event(*describe_tool(c.get("name", ""), c.get("input") or {}, workspace))
+
+        p = _run_stream(cmd, prompt, workspace, self.timeout, self.label, on_line)
+        result = state["result"]
         if result is None:
             raise AgentError(f"Claude returned no result event:\n{p.stdout[-3000:]}\n{p.stderr}")
         if result.get("is_error"):
@@ -115,8 +216,9 @@ class GptAgent:
         self.model = model
         self.timeout = timeout
 
-    def run(self, prompt, system, workspace, can_edit, perms=None):
-        """perms: network (bool), auto_review (bool). GPT can't route approvals to the chat; the sandbox decides."""
+    def run(self, prompt, system, workspace, can_edit, perms=None, on_event=None):
+        """perms: network, bypass, writable, auto_review. GPT can't route approvals to the chat; the sandbox decides.
+        on_event(kind, text) is called live (commands, file changes, searches)."""
         perms = perms or {}
         fd, out_path = tempfile.mkstemp(prefix="ai-office-gpt-", suffix=".txt")
         os.close(fd)
@@ -124,9 +226,10 @@ class GptAgent:
             "codex", "exec",
             "-C", str(workspace),
             *(["--dangerously-bypass-approvals-and-sandbox"] if perms.get("bypass") and can_edit
-              else ["-s", "workspace-write" if can_edit else "read-only"]),
+              else ["-s", "workspace-write" if can_edit or perms.get("writable") else "read-only"]),
             "-o", out_path,
             "--color", "never",
+            "--json",
         ]
         if self.model:
             cmd += ["-m", self.model]
@@ -135,10 +238,35 @@ class GptAgent:
         if perms.get("auto_review"):
             cmd.append("--approve-for-me")
         cmd.append("-")  # prompt from stdin
+        last_message = []
+
+        def on_line(line):
+            ev = json.loads(line)
+            item = ev.get("item") or {}
+            kind, typ = ev.get("type"), item.get("type")
+            if typ == "agent_message" and kind == "item.completed":
+                last_message.append(item.get("text", ""))
+            if not on_event:
+                return
+            if typ == "command_execution" and kind == "item.started":
+                c = item.get("command", "")
+                c = c.split(" -lc ", 1)[1].strip("'\"") if " -lc " in c else c
+                on_event("command", f"ran {_short(c)}")
+            elif typ == "file_change" and kind == "item.completed":
+                for ch in item.get("changes") or []:
+                    verb = {"add": "created", "delete": "deleted"}.get(ch.get("kind"), "edited")
+                    on_event("edit", f"{verb} {_rel(ch.get('path', ''), workspace)}")
+            elif typ == "web_search" and kind == "item.started":
+                on_event("web", f"searched the web for “{_short(item.get('query', ''), 50)}”")
+            elif typ == "mcp_tool_call" and kind == "item.started":
+                on_event("other", f"used {item.get('tool') or 'a tool'}")
+            elif typ == "todo_list" and kind == "item.started":
+                on_event("plan", "made a todo list")
+
         try:
-            p = _run(cmd, f"{system}\n\n{prompt}", workspace, self.timeout, self.label)
+            _run_stream(cmd, f"{system}\n\n{prompt}", workspace, self.timeout, self.label, on_line)
             text = Path(out_path).read_text().strip()
-            return text or p.stdout.strip()
+            return text or (last_message[-1].strip() if last_message else "")
         finally:
             Path(out_path).unlink(missing_ok=True)
 
@@ -153,8 +281,16 @@ class FakeAgent:
         self.calls = 0
         self.last_rate_limit = None
 
-    def run(self, prompt, system, workspace, can_edit, perms=None):
-        _run(["sleep", os.environ.get("AI_OFFICE_FAKE_DELAY", "0.3")], "", workspace, 60, self.label)
+    def run(self, prompt, system, workspace, can_edit, perms=None, on_event=None):
+        delay = float(os.environ.get("AI_OFFICE_FAKE_DELAY", "0.3"))
+        steps = [("read", "read README.md"), ("command", "ran npm test"), ("search", "searched for “TODO”")]
+        for kind, text in steps:
+            _run(["sleep", str(delay / len(steps))], "", workspace, 60, self.label)
+            if on_event:
+                on_event(kind, text)
+        if on_event and os.environ.get("AI_OFFICE_FAKE_SNEAKY") and not can_edit:
+            on_event("edit", "edited app.py")  # a reviewer misbehaving, for tests
+            (Path(workspace) / "sneaky.txt").write_text("reviewer was here\n")
         asked = ""
         cmd = os.environ.get("AI_OFFICE_FAKE_ASK")
         if cmd and can_edit and perms and perms.get("mcp_config"):
@@ -171,7 +307,8 @@ class FakeAgent:
             f = Path(workspace) / "fake_output.txt"
             with f.open("a") as fh:
                 fh.write(f"{self.label} edit #{self.calls}\n")
-            return (f"[fake] {self.label} appended a line to fake_output.txt.{asked}\n"
+            long = "".join(f"- detail line {i} about the change\n" for i in range(12)) if os.environ.get("AI_OFFICE_FAKE_LONG") else ""
+            return (f"[fake] {self.label} appended a line to fake_output.txt.{asked}\n{long}"
                     f"REPORT: changed fake_output.txt; no tests; blockers none\nSTATUS: CONTINUE")
         self.reviews = getattr(self, "reviews", 0) + 1
         if self.reviews >= 2:

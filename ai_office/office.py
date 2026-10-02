@@ -18,6 +18,7 @@ REPORT_RE = re.compile(r"^\s*REPORT:\s*(.+)$", re.I | re.M)
 MAX_RESULT_CHARS = 6000
 DEFAULT_ALLOW = ["Bash(ls:*)", "Bash(cat:*)", "Bash(pwd)", "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)"]
 READ_TOOLS = ["Read", "Grep", "Glob"]
+SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", ".next", "dist", "build", ".cache"}
 WEB_TOOLS = ["WebFetch", "WebSearch"]
 PERMISSION_MODES = {
     "full": "everything runs; only risky/system stuff (safety.py) is asked",
@@ -114,6 +115,7 @@ class Office:
         self.manager_window = loop.get("manager_window", 16)
         self.max_handoffs = loop.get("max_handoffs", 3)
         self.max_manager_steps = loop.get("max_manager_steps", 8)
+        self.live_every = loop.get("live_summary_every", 45)  # seconds; 0 = off
         self.roles = {"builder": loop.get("builder", "claude"), "reviewer": loop.get("reviewer", "gpt")}
         self.deepseek = deepseek
         self.ds_on = deepseek is not None
@@ -163,6 +165,8 @@ class Office:
         if key == "gpt":  # codex can't forward approvals: its sandbox is the safety net
             return {"network": mode == "full" or self.perm["gpt_network"],
                     "bypass": mode == "full" and self.perm["gpt_unsandboxed"],
+                    # reviewer/consult may write (test caches etc.); edits to project files are flagged
+                    "writable": can_edit or self.perm["reviewer_can_run"],
                     "auto_review": self.perm["gpt_auto_review"]}
         allowed = list(self.perm["claude_allow"]) + self.load_rules() + READ_TOOLS
         if mode == "full":
@@ -233,9 +237,11 @@ class Office:
             return {"behavior": "deny", "message": "No human available to approve this."}
         rule = approvals.rule_for(tool, tin)
         self.pending = {"event": threading.Event(), "answer": None}
-        ui.say("system", f"🔐 {who} wants to {what}" + (f"\n   ⚠ flagged: {risk}" if risk else "") +
-               (f"\n   DeepSeek: {reason}" if reason else "") +
-               f"\n   [y] allow  [a] always ({rule or 'n/a'})  [n] deny  · or type a reason to deny")
+        text = (f"🔐 {who} wants to {what}" + (f"\n   ⚠ flagged: {risk}" if risk else "") +
+                (f"\n   DeepSeek: {reason}" if reason else ""))
+        hint = "" if ui.has_sink() else f"\n   [y] allow  [a] always ({rule or 'n/a'})  [n] deny  · or type a reason to deny"
+        ui.say("system", text + hint)
+        ui.request_approval(text, rule)
         while not self.pending["event"].wait(0.2):
             if adapters.cancelled.is_set():
                 self.pending = None
@@ -327,20 +333,44 @@ class Office:
         elif do == "list_files":
             p = self._inside_workspace(a.get("path"))
             if not p.is_dir():
-                raise ValueError(f"{a.get('path')!r} is not a folder")
-            skip = {".git", "node_modules", "__pycache__", ".venv", ".next", "dist", "build", ".cache"}
-            items = []
-            for root, dirs, files in os.walk(p):
-                depth = len(Path(root).relative_to(p).parts)
-                dirs[:] = sorted(d for d in dirs if d not in skip and not d.startswith(".")) if depth < 2 else []
-                for name in sorted(dirs) + sorted(files):
-                    f = Path(root) / name
-                    rel = f.relative_to(self.workspace)
-                    items.append(f"{rel}/" if f.is_dir() else f"{rel}  ({f.stat().st_size if f.exists() else 0} B)")
+                raise ValueError(f"{a.get('path')!r} is not a folder (try find)")
+            items, level = [], [p]
+            for depth in range(2):  # breadth-first: the whole top level before going deeper
+                nxt = []
+                for d in level:
+                    try:
+                        entries = sorted(d.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower()))
+                    except OSError:
+                        continue
+                    for f in entries:
+                        if f.name in SKIP_DIRS or (f.name.startswith(".") and f.is_dir()):
+                            continue
+                        rel = f.relative_to(self.workspace)
+                        items.append(f"{rel}/" if f.is_dir() else f"{rel}  ({f.stat().st_size if f.exists() else 0} B)")
+                        if f.is_dir():
+                            nxt.append(f)
+                level = nxt
                 if len(items) >= 300:
-                    items = items[:300] + ["… (truncated; list a subfolder)"]
                     break
+            if len(items) > 300:
+                items = items[:300] + ["… (truncated; list a subfolder or use find)"]
             out = "\n".join(items) or "(empty)"
+        elif do == "find":
+            name = str(a.get("name", "")).strip().lower()
+            if not name:
+                raise ValueError("find needs a name")
+            hits = []
+            for root, dirs, files in os.walk(self.workspace):
+                if len(Path(root).relative_to(self.workspace).parts) >= 5:
+                    dirs[:] = []
+                dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
+                for n in dirs + files:
+                    if name in n.lower():
+                        f = Path(root) / n
+                        hits.append(f"{f.relative_to(self.workspace)}{'/' if f.is_dir() else ''}")
+                if len(hits) >= 50:
+                    break
+            out = "\n".join(hits[:50]) or f"nothing named like {name!r} (searched 5 levels deep)"
         else:  # read_file
             p = self._inside_workspace(a.get("path"))
             if not p.is_file():
@@ -408,9 +438,10 @@ class Office:
                     result = self.set_permission_mode(a.get("mode"))
                 elif do == "forget_chat":
                     result = self.forget_chat()
-                elif do in ("list_files", "read_file", "git_log"):
-                    ui.note(f"{by} looks up: {do} {a.get('path', '')}".rstrip())
-                    self.notes.append(f"{do} {a.get('path', '')}:\n{self.lookup(do, a)}")
+                elif do in ("list_files", "read_file", "git_log", "find"):
+                    arg = a.get("path") or a.get("name") or ""
+                    ui.note(f"{by} looks up: {do} {arg}".rstrip())
+                    self.notes.append(f"{do} {arg}:\n{self.lookup(do, a)}")
                     continue
                 else:
                     raise ValueError(f"unknown action {a!r}")
@@ -560,21 +591,66 @@ class Office:
     # ---------- team (Claude ⇄ GPT) ----------
 
     def call_agent(self, key, prompt, system, role, doing):
-        """Run Claude or GPT once, keeping usage numbers fresh. Raises AgentError/AgentCancelled."""
+        """Run Claude or GPT once: live actions, DeepSeek narration, usage, read-only check.
+        Raises AgentError/AgentCancelled."""
+        label = self.label(key)
         five_h = self.usage.pct(key)
         if five_h is not None and five_h >= 90:
-            ui.say("error", f"{self.label(key)} is at {five_h}% of its 5-hour limit")
-        ui.note(f"{self.label(key)} ({self.model_name(key)}) is {doing}")
+            ui.say("error", f"{label} is at {five_h}% of its 5-hour limit")
+        ui.note(f"{label} ({self.model_name(key)}) is {doing}")
         started = datetime.now().timestamp()
         agent = self.agents[key]
+        live = {"actions": [], "done": threading.Event(), "warned": set()}
+        before = gitops.status_snapshot(self.workspace) if role != "builder" else None
+
+        def on_event(kind, text):
+            live["actions"].append(text)
+            ui.set_activity(f"{label} › {text}")
+            with self.log_path.open("a") as f:
+                f.write(f"\n> ▸ {label}: {text}\n")
+            if kind == "edit" and role != "builder" and text not in live["warned"]:
+                live["warned"].add(text)
+                ui.say("error", f"{label} ({role}) {text}, but it's supposed to be read-only")
+                self.notes.append(f"WARNING: the {role} {label} {text} although it must not edit files.")
+
+        narrator = None
+        if self.ds_on and self.live_every > 0:
+            narrator = threading.Thread(target=self._narrate, args=(key, role, live), daemon=True)
+            narrator.start()
         try:
             return agent.run(prompt, system, self.workspace, can_edit=(role == "builder"),
-                             perms=self.perms_for(key, role))
+                             perms=self.perms_for(key, role), on_event=on_event)
         finally:
+            live["done"].set()
             if key == "claude":
                 self.usage.update_claude(agent.last_rate_limit)
             else:
                 self.usage.update_gpt(since=started)
+            if before is not None:
+                changed = gitops.status_snapshot(self.workspace) - before
+                if changed:
+                    files = ", ".join(sorted(line[3:] for line in changed)[:8])
+                    ui.say("error", f"{label} ({role}) changed project files although it's read-only: {files}")
+                    self.notes.append(f"WARNING: {label} ({role}) changed files while read-only: {files}")
+
+    def _narrate(self, key, role, live):
+        """Every live_every seconds, DeepSeek turns new actions into one line for you."""
+        seen, last_line = 0, ""
+        while not live["done"].wait(self.live_every):
+            new = live["actions"][seen:]
+            if not new:
+                continue
+            seen += len(new)
+            ctx = (f"agent: {self.label(key)} ({role})\ngoal: {self.goal or '(answering a question)'}\n"
+                   f"previous update: {last_line or '(none)'}\nrecent actions (oldest first):\n- " +
+                   "\n- ".join(live["actions"][-25:]))
+            try:
+                line = self.deepseek.narrate(ctx)
+            except DeepSeekError:
+                continue
+            if line and not live["done"].is_set():
+                last_line = line
+                ui.say("deepseek", line, tag="live")
 
     def take_turn(self, role):
         key = self.roles[role]
@@ -717,14 +793,15 @@ class Office:
 
     # ---------- UI hooks ----------
 
-    def start(self):
+    def start(self, show_status=True):
         if self.is_sandbox() and gitops.ensure_repo(self.workspace):
             self.system(f"initialized git in {self.workspace}")
         if self.workspace.resolve() == Path.home():
             self.system("workspace is your home folder: the AIs can work anywhere in ~. Your config/dotfiles, "
                         "secrets and whole top-level folders are still protected for Claude (asked first). "
                         "GPT's sandbox covers all of ~ and can't ask first.")
-        self.handle_command("/status")
+        if show_status:
+            self.handle_command("/status")
         self.system("type a message · /help for keys and commands")
         threading.Thread(target=self._worker, daemon=True).start()
 

@@ -20,12 +20,24 @@ STYLE = {
     "error": ("❌", "error", "\033[91m"),
 }
 
-# what the office is doing right now (shown in the bottom bar)
+# what the office is doing right now (shown above the input / in the side panel)
 activity = {"text": "", "since": 0.0}
 _print_lock = threading.Lock()
+_sink = None  # the full-screen app, when running; otherwise we print
+
+
+def set_sink(sink):
+    global _sink
+    _sink = sink
+
+
+def has_sink():
+    return _sink is not None
 
 
 def say(who, text, tag=""):
+    if _sink:
+        return _sink.say(who, text, tag)
     icon, name, color = STYLE.get(who, ("•", who, ""))
     head = f"{color}{BOLD}{icon} {name}{RESET}"
     if tag:
@@ -36,12 +48,28 @@ def say(who, text, tag=""):
 
 def note(text):
     activity["text"], activity["since"] = text, time.time()
+    if _sink:
+        return _sink.note(text)
     with _print_lock:
         print(f"{DIM}  … {text}{RESET}", flush=True)
 
 
+def set_activity(text):
+    """Update the live status line without resetting its timer (and without a chat line)."""
+    activity["text"] = text
+    if _sink is None:
+        with _print_lock:
+            print(f"{DIM}  ▸ {text}{RESET}", flush=True)
+
+
 def idle():
     activity["text"] = ""
+
+
+def request_approval(text, rule):
+    """Ask for a y/a/n answer. The app shows a dialog; plain mode answers via the input box."""
+    if _sink:
+        _sink.request_approval(text, rule)
 
 
 # ---------- input ----------
@@ -68,13 +96,21 @@ KEYS_HELP = """keys:
   Ctrl+W / Ctrl+⌫      delete word     Ctrl+U / Ctrl+K   delete to start/end of line
   ↑/↓                  move lines, then history       Ctrl+R   search history
   Tab                  complete /commands and model names
+  Ctrl+O               expand/collapse the latest Claude/GPT reply (or click it)
   Ctrl+L               clear screen    Ctrl+D (empty) or Ctrl+C twice   quit"""
 
 
-def run(office, history_path):
+def run(office, history_path, plain=False):
     """Main loop. office must provide: start(), submit(text), busy, cancel(), completions(words)."""
     if not sys.stdin.isatty():
         return _run_plain(office)
+    if not plain:
+        try:
+            from .tui import run_app
+        except ImportError as e:
+            print(f"full-screen UI unavailable ({e}); using --plain")
+        else:
+            return run_app(office, history_path.with_name("tui_history.json"))
     try:
         import prompt_toolkit  # noqa: F401
     except ImportError:

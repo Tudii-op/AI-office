@@ -44,3 +44,12 @@ def log(workspace, n=10):
 def is_repo_root(workspace):
     r = _git(workspace, "rev-parse", "--show-toplevel", check=False)
     return r.returncode == 0 and r.stdout.strip() == str(workspace.resolve())
+
+
+def status_snapshot(workspace):
+    """Set of `git status --porcelain` lines for a project repo (not ~), else an empty set."""
+    from pathlib import Path
+    if Path(workspace).resolve() == Path.home() or not is_repo_root(Path(workspace)):
+        return set()
+    r = _git(workspace, "status", "--porcelain", "--untracked-files=all", check=False)
+    return set(r.stdout.splitlines()) if r.returncode == 0 else set()

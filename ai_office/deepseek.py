@@ -63,6 +63,10 @@ class DeepSeek:
         user = f"Previous recap:\n{previous or '(none)'}\n\nNew messages:\n{transcript}"
         return self.chat(prompts.load("recap"), user).strip()
 
+    def narrate(self, context):
+        line = self.chat(prompts.load("narrator"), context).strip().splitlines()
+        return line[0].strip().strip('"')[:200] if line else ""
+
     def approve(self, request):
         raw = self.chat(prompts.load("approver"), request, json_mode=True)
         try:
@@ -86,6 +90,10 @@ class DeepSeek:
 
 class FakeDeepSeek:
     """Costs nothing. Used with --fake."""
+
+    def narrate(self, context):
+        last = context.strip().splitlines()[-1].lstrip("- ")
+        return f"[fake live] {context.splitlines()[0].split(': ', 1)[1]} is at it: {last}"
 
     def approve(self, request):
         if "run: ls" in request or "run: cat" in request:

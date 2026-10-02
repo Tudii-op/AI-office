@@ -21,6 +21,7 @@ codex login             # make sure you're logged in
 ai-office                         # the AIs work where you run it (like claude / codex); ~ works too
 ai-office -w ~/Workplace/foo      # or pick a folder
 ai-office --fake                  # free dry run, no AI calls
+ai-office --plain                 # classic inline terminal UI instead of the full-screen app
 ```
 (installed globally with `uv tool install -e .`; or `python -m ai_office ...`)
 
@@ -62,23 +63,32 @@ Risky requests go: your saved "always" rules → DeepSeek (`prompts/approver.md`
 - `config.toml`: turn limits, recap frequency, models list, DeepSeek model, timeouts.
 - DeepSeek remembers your chat across restarts (`state/manager_history.json`); `/forget` clears it.
 
+## Live view
+- While Claude/GPT work, the line above the input shows their current action (`Claude › ran pnpm vitest`), streamed live from `claude --output-format stream-json` / `codex exec --json`, at no extra cost.
+- Every `live_summary_every` seconds (default 45, `config.toml`), DeepSeek posts a one-line update (`prompts/narrator.md`).
+- Claude/GPT replies start **collapsed**: a 3-line preview + their REPORT/STATUS line. Click the reply or press **Ctrl+O** (latest) to expand.
+- Reviewers may write temp/test files (GPT gets a writable sandbox so tests run), but any project edit by a reviewer is flagged live and double-checked with `git status` after the turn.
+
+## Screen
+Full-screen TUI (Textual, uses your terminal background): one chat panel that starts with a session card (team, models, usage bars, manager, settings; `/status` posts a fresh one), REPORT/STATUS lines shown as a colored footer, input at the bottom, approval requests as a dialog (Allow / Always / Deny, or type a reason). Mouse scroll works; every session is also saved in `logs/`.
+
 ## Keys
 | key | does |
 |---|---|
 | Enter | send |
-| Ctrl+J · Alt+Enter · `\` at line end · Shift+Enter* | new line |
+| Shift+Enter · Ctrl+J · Alt+Enter · `\` at line end | new line |
 | Esc / Ctrl+C | stop the AIs (working) · clear input (idle) |
 | Ctrl+←/→, Alt+B/F | jump by word |
 | Shift+arrows | select |
 | Ctrl+W / Ctrl+Backspace | delete word |
 | Ctrl+U / Ctrl+K | delete to line start / end |
 | ↑/↓ | move between lines, then history |
-| Ctrl+R | search history |
-| Tab | complete /commands and model names |
-| Ctrl+L | clear screen |
+| `/` + Tab or Enter | command popup (↑/↓ to pick) |
+| Ctrl+O / click | expand or collapse a Claude/GPT reply |
+| Ctrl+L | clear chat |
+| mouse drag | select text → copied automatically (terminal clipboard + wl-copy); Shift+drag = kitty’s own selection |
 | Ctrl+D or Ctrl+C twice | quit |
 
-\*Shift+Enter in kitty needs this line in `kitty.conf`: `map shift+enter send_text all \x1b[13;2u`
 
 ## Usage tracking
 Claude's and GPT's 5-hour and weekly subscription limits are recorded after every turn (from Claude's `rate_limit_event` and Codex's local session logs), so there are no extra calls. DeepSeek sees them and warns you above ~80%. Model/role/turn changes are remembered in `state/`.

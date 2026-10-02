@@ -28,6 +28,7 @@ def main():
     ap.add_argument("-w", "--workspace", default=os.getcwd(),
                     help="folder the AIs work in (default: where you run ai-office; can be ~)")
     ap.add_argument("-c", "--config", default=str(ROOT / "config.toml"))
+    ap.add_argument("--plain", action="store_true", help="classic inline terminal UI instead of the full-screen app")
     ap.add_argument("--fake", action="store_true", help="fake Claude/GPT/DeepSeek: test the flow for free")
     args = ap.parse_args()
 
@@ -52,7 +53,7 @@ def main():
     sub = "fake" if args.fake else ""  # fake runs never touch real logs/state
     office = Office(agents, workspace, cfg, deepseek=deepseek, log_dir=ROOT / "logs" / sub,
                     state_dir=ROOT / "state" / sub, workspaces_dir=ROOT / "workspaces")
-    ui.run(office, history_path=ROOT / "state" / sub / "input_history")
+    ui.run(office, history_path=ROOT / "state" / sub / "input_history", plain=args.plain)
 
 
 if __name__ == "__main__":

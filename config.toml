@@ -4,6 +4,7 @@ recap_every = 4        # DeepSeek recaps after this many new messages
 keep_recent = 2        # messages kept word-for-word after a recap
 no_recap_window = 10   # messages sent as context when DeepSeek is off
 auto_commit = "sandbox"  # commit each turn: "sandbox" (only AI-office/workspaces/*), "always" (any repo root except ~), "never"
+live_summary_every = 45  # seconds between DeepSeek's one-line live updates while an AI works (0 = off)
 builder = "claude"     # who edits files
 reviewer = "gpt"       # who reviews (read-only)
 

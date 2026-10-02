@@ -11,6 +11,7 @@ Variables like `$me` are filled in by the office (unknown ones are left as-is).
 | `team.md` | Claude/GPT | shared intro for team turns | `$me $other $role $boss` |
 | `builder.md` | builder | team turn (edits files) | `$me $other $ask` |
 | `reviewer.md` | reviewer | team turn (read-only) | `$me $other $ask` |
+| `narrator.md` | DeepSeek | one-line live updates while Claude/GPT work | none |
 | `approver.md` | DeepSeek | approving commands/edits Claude asks permission for | none |
 | `consult.md` | Claude/GPT | DeepSeek asks one of them a question | `$me` |
 | `boss_manager.md` / `boss_human.md` | | fills `$boss` (DeepSeek on / off) | |
